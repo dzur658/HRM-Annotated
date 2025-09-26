@@ -14,72 +14,131 @@ from models.sparse_embedding import CastedSparseEmbedding
 
 @dataclass
 class HierarchicalReasoningModel_ACTV1InnerCarry:
+    # Holds the hidden state of the high level module
     z_H: torch.Tensor
+
+    # Holds the hidden state of the low level module
     z_L: torch.Tensor
 
 
 @dataclass
 class HierarchicalReasoningModel_ACTV1Carry:
+    # Holds the inner state for the modules
     inner_carry: HierarchicalReasoningModel_ACTV1InnerCarry
     
+    # Tracks the reasoning segments 1-d tensor (batch_size,)
     steps: torch.Tensor
+
+    # a 1-d bool tensor (batch_size,) indicating whether the stop reasoning signal is given
     halted: torch.Tensor
     
+    # A dictionary holding the vectorized inputs for items currently being processed
     current_data: Dict[str, torch.Tensor]
 
 
 class HierarchicalReasoningModel_ACTV1Config(BaseModel):
+    # integer defining the size of the current batch
     batch_size: int
+    # sequence length of the input
     seq_len: int
+    # puzzle embedding dimension
     puzzle_emb_ndim: int = 0
+    # total number of unique tasks in the dataset
     num_puzzle_identifiers: int
+    # vocabulary size of the input tokens
     vocab_size: int
 
+    # How many updates are allowed for each module in the forward pass
+    # "For each H module cycle the L module is run L_cycles times" preserving the nested architecture
     H_cycles: int
     L_cycles: int
 
+    # Set the number of transformer blocks for the high-level and low-level modules
     H_layers: int
     L_layers: int
 
     # Transformer config
+    # define the length of the corresponding vector for the token in the sequence
     hidden_size: int
+    # Multiplies the hidden size vector by this number to temporarily expand the vector for processing by non-linear functions (SwiGLUs) and then reduces it
+    # back to the original hidden size
     expansion: float
+    # number of parallel attention heads assigned to each chunk. The hidden size vector is split across these heads,
+    # allowing the model to focus on different parts of the input simultaneously
     num_heads: int
+    # Will be either RoPE or learned positional embeddings for tracking the order of tokens
     pos_encodings: str
 
+    # Root Mean Square Epsilon normalization of tensors, this sets the value for that epsilon to be added
+    # to protect against potentially dividing by zero (see RMS Epsilon equation)
     rms_norm_eps: float = 1e-5
+    # Theta value for RoPE, which defines the level of frequency for each token embedding,
+    # essentially pointing at how precisely the model can know the position of a given token.
+    # A larger value will result in a lower frequency of the rotational signals, which will lead to the
+    # model being less sensitive to the exact positions of tokens, and more focused on broader positional
+    # relationships. Conversely, a smaller theta value will increase the frequency of the rotational signals,
+    # making the model more sensitive to the exact positions of tokens within the sequence.
     rope_theta: float = 10000.0
     
     # Halting Q-learning config
+    # Maximum number of reasoning segments the model is allowed to perform before
+    # it's cut off
     halt_max_steps: int
+    # During training, a random minimum number of steps is defined to
+    # encourage the model to think longer/deeper about the given
+    # task. This float defines the probability of that happening
     halt_exploration_prob: float
 
+    # Sets the precision of the forward pass (standard brain float 16, or bfloat16)
     forward_dtype: str = "bfloat16"
 
-
+# Creates a simple transformer block to be used by both the H and L modules.
+# The block, as is standard for a transformer block, consists of 1 attention layer,
+# and one Feed Forward Network Layer (this uses SwiGLU as the non-linear activation function)
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
         super().__init__()
 
+        # Initialize the self attention layer
         self.self_attn = Attention(
+            # hidden size and the number of heads come from the config
             hidden_size=config.hidden_size,
+            # floor divide hidden size, by the number of heads to get the dimension of each head
             head_dim=config.hidden_size // config.num_heads,
+            # number of heads comes from the config
             num_heads=config.num_heads,
+            # Set the KV heads to be the same as the number of heads
             num_key_value_heads=config.num_heads,
+            # Attention is bidirectional and encoder based (bert-like)
             causal=False
         )
+        # Initialize the SwiGLU
         self.mlp = SwiGLU(
+            # hidden size and expansion come from the config
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
+        # Store the epsilon value for RMS Epsilon normalization
+        # to be used in the forward pass
         self.norm_eps = config.rms_norm_eps
 
+    # Block computation (Attention + FFN). Takes in the hidden states and the cos/sin positional encodings (if RoPE is used)
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Post Norm
+        # Post Norm - Normalization happens after computation as per the HRM foundational paper
         # Self Attention
+        # Pass the hidden states through the attention layer first, and then added back to the original hidden states via a 
+        # skip connection. Skip connections allow for training of very deep networks by mitigating the vanishing gradient problem
+        # and allowing gradients to flow better. The result is then normalized using RMS Epsilon normalization.
         hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
         # Fully Connected
+        # Attention encoded hidden layer now flows into the Multi Layer Perceptron (MLP) block, which consists of two linear layers projecting up in parallel.
+        # The resulting output of the first linear is then passed through an activation function, and then element-wise multiplied with the output of the second linear layer.
+        # Only the resulting tensor of the first linear upscaler is passed through the activation function, and the second linear layer acts as a gating mechanism (aka remains at the pre swished value)
+        # The resulting tensor is then projected back down to the original hidden size.
+        # Hidden state passes through the MLP, then is added back to the original
+        # hidden states via another skip connection, and then normalized again using RMS Epsilon normalization.
         hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
+        # Final fully processed tensor is returned
         return hidden_states
 
 

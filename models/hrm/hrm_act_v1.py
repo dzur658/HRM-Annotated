@@ -141,44 +141,69 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
         # Final fully processed tensor is returned
         return hidden_states
 
-
+# Stacks blocks to create a full reasoning module (either H or L)
 class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
+    # Initializes all the individual blocks into a list of layers
     def __init__(self, layers: List[HierarchicalReasoningModel_ACTV1Block]):
         super().__init__()
 
+        # Store the layers as a ModuleList so that PyTorch can properly register them
+        # and track their parameters
         self.layers = torch.nn.ModuleList(layers)
 
+    # Main computational logic for the module
+    # If this is an L module it takes in the hidden state of the L module
+    # and the input injection from the H module (and vice versa for the H module using the final state of the L module for injection)
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         # Input injection (add)
         hidden_states = hidden_states + input_injection
         # Layers
         for layer in self.layers:
+            # The hidden state tensor is then passed through all the blocks in the module
+            # and the input for the next block is the output of the previous block
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-
+        
+        # Final processed hidden states are returned
         return hidden_states
 
-
+# This class provides the blue print for the orchestration of the H and L modules
 class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
         super().__init__()
+        # store config values of the current model
         self.config = config
+        # Set the precision of the forward pass (ex bfloat16) as defined in the config class
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
         # I/O
+        # Used for setting the initial weights ONCE and ensuring random weights remain in the goldilocks zone
+        # to avoid exploding or vanishing gradients.
+        # Calculate the square root of the hidden size to be used for scaling the embeddings
         self.embed_scale  = math.sqrt(self.config.hidden_size)
+        # Calculate the standard deviation for initializing the weights of the token embeddings
         embed_init_std = 1.0 / self.embed_scale
 
+        # Converts token ids into their respective vector representations
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        # final layer to project the hidden states back to the vocabulary size for LM output (specifically to get logits for each token in the vocab)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # Q head for halting decision (2 numerical outputs representing: halt & continue signals)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
 
+        # Calculate how many chunks of the size of the hidden size are needed to hold the puzzle embedding
+        # Uses the negative value of hidden state to result in the absolute value of floor division effectively
+        # rounding up (ceiling division)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
+        # Checks to make sure puzzle feature is enabled correctly
         if self.config.puzzle_emb_ndim > 0:
             # Zero init puzzle embeddings
+            # Only focus on updating vectors of puzzles in the current batch
+            # All puzzles in the table will initially have vectors set to 0s
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
 
         # LM Blocks
+        # Creates either RoPE or learned positional embeddings based on the config
         if self.config.pos_encodings == "rope":
             self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
                                               max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
@@ -189,31 +214,41 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             raise NotImplementedError()
 
         # Reasoning Layers
+        # Put all the H blocks together to create the H module
         self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
+        # Put all the L blocks together to create the L module
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
         
         # Initial states
+        # Randomly initialize the static hidden state parameters of both the H and L modules
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
+        # Prevents the Q Head from stopping prematurely at the start of training
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
+    # Take raw input token ids and puzzle identifiers to produce the input embeddings
+    # It will create a single rich tensor combining token embeddings, puzzle embeddings (if enabled), and positional encodings
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings
+        # Check for puzzle configuration
         if self.config.puzzle_emb_ndim > 0:
+            # Fetch the learned vector for the particular puzzle identifier
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
+            # Make sure the puzzle embedding is of the right shape, and add padding (0s) if not
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
+            # Concatenate the puzzle embedding to the start of the token embeddings
             embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
 
         # Position embeddings
@@ -221,92 +256,128 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             # scale by 1/sqrt(2) to maintain forward variance
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
-        # Scale
+        # Scale the embedding by the square root of the hidden size (from Transformers foundational paper)
         return self.embed_scale * embedding
-
+    
+    # Create an empty carry state for both the H and L modules
     def empty_carry(self, batch_size: int):
         return HierarchicalReasoningModel_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
-        
+    
+    # State management function to reset the carry state of both the H and L modules
+    # It uses a reset flag to determine which sequences in the batch need to be reset (e.g. new tasks)
+    # and resets those sequences to the initial hidden states defined in the constructor.
     def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
+        # if the reset flag is true, it fills in the hidden state of the initial value,
+        # but if it is false it keeps the current hidden state from the previous step
         return HierarchicalReasoningModel_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
-
+    # Performs one full reasoning segment
     def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Create RoPE embeddings if used
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
         # Input encoding
+        # Combine puzzle and input token embeddings (and positional encodings if learned)
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
-        # Forward iterations
+        # Forward iterations without gradients being tracked
         with torch.no_grad():
+            # set the states to the carried states
             z_H, z_L = carry.z_H, carry.z_L
 
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
+                    # Update the z_L state so long as it's not the last L step of the last H step
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
                         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-
+                
+                # Update the z_H state so long as it's not the last H step
                 if not (_H_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, z_L, **seq_info)
 
+        # Sanity check to confirm there is no gradient history from
+        # the recursion loop
         assert not z_H.requires_grad and not z_L.requires_grad
 
         # 1-step grad
+        # Get the gradients of the final states of both modules
         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
-        # LM Outputs
-        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        # LM Output
+        # New carry no grad
+        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        # Pass the final hidden state of the high level module to the lm head to get the prediction logits
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
 
         # Q head
+        # Use the hidden state of the first token (which is always a puzzle token) to decide whether to halt or continue
+        # This is because the first token always has the full context of the entire sequence after processing
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
+        # return the new carry state, the output logits, and the halt/continue Q logits
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-
+# Manages the inner model and the Adaptive Computation Time (ACT) logic
+# Will call the forward pass method repeatedly and check the Q head
+# for stoppage signals
 class HierarchicalReasoningModel_ACTV1(nn.Module):
     """ACT wrapper."""
 
+    # Extract the config and the model
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = HierarchicalReasoningModel_ACTV1Config(**config_dict)
         self.inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
 
+    # Property to return the puzzle embedding layer if enabled
     @property
     def puzzle_emb(self):
         return self.inner.puzzle_emb
 
+    # Set the initial state for ACT at the beginning of a new batch
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        # Get the batch size from the input batch
         batch_size = batch["inputs"].shape[0]
 
         return HierarchicalReasoningModel_ACTV1Carry(
+            # Create an empty state for the z_H and z_L states of the inner model
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            
+
+            # Initialize the step counter for all items in the batch to 0
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            # Initialize the halted flag for all items in the batch to True so that will treat
+            # every item as "new" and reset its state in the first forward pass
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
             
+            # Create an empty dictionary with the right tensor shapes to hold the current data for each item in the batch
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
-        
+
+    # The grand forward pass of ACT    
     def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
+        # Set the step counter to 0 for any sequences that were halted in the previous step
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
+        # Update current data to include new sequences that were halted in the previous step
+        # Replace finished data with new data from the input batch, otherwise keep the old data
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
+        # Call the forward method on the inner model to perform one reasoning segment
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
 
+        # Store results from the forward pass in a dictionary
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
@@ -321,12 +392,14 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
             halted = is_last_step
 
             # if training, and ACT is enabled
+            # Check if maximum allowed steps have been reached
             if self.training and (self.config.halt_max_steps > 1):
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
                 halted = halted | (q_halt_logits > q_continue_logits)
 
                 # Exploration
+                # During training the model must think for the minimum number of steps defined by the exploration probability
                 min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
 
                 halted = halted & (new_steps >= min_halt_steps)
@@ -335,8 +408,11 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 # NOTE: No replay buffer and target networks for computing target Q-value.
                 # As batch_size is large, there're many parallel envs.
                 # Similar concept as PQN https://arxiv.org/abs/2407.04811
+                # Peak into the future and see what the next Q would be
                 next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
                 
+                # Added to the outputs dictionary for loss computation of the Q head
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
+        # Return the updated carry and outputs
         return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

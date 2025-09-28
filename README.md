@@ -1,3 +1,6 @@
+# HRM Annotated
+The original HRM scripts from Sapient AI with my personal annotations on how the model works!
+
 # Hierarchical Reasoning Model
 
 ![](./assets/hrm.png)

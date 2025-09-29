@@ -22,24 +22,24 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
-
+# Defines the configuration for the loss function with a name
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     
     name: str
 
-
+# Specify the architecture and associated loss configuration
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
 
     name: str
     loss: LossConfig
 
-
+# Defines parameters for pretraining to run
 class PretrainConfig(pydantic.BaseModel):
-    # Config
+    # Configure the Architecture
     arch: ArchConfig
-    # Data
+    # Path to dataset
     data_path: str
 
     # Hyperparams
@@ -54,7 +54,7 @@ class PretrainConfig(pydantic.BaseModel):
     beta1: float
     beta2: float
 
-    # Puzzle embedding
+    # Puzzle embedding hyperparams
     puzzle_emb_lr: float
     puzzle_emb_weight_decay: float
 
@@ -67,67 +67,98 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
+    # Optionally save certain tensors for inspection and analysis during evaluation
     eval_save_outputs: List[str] = []
 
-
+# Holds all the "moving parts" of the training loop
 @dataclass
 class TrainState:
+    # The HRM model itself at the current state of training
     model: nn.Module
+    # Optimizer objects (AdamATan2, CastedSparseEmbeddingSignSGD_Distributed, etc.)
     optimizers: Sequence[torch.optim.Optimizer]
+    # Learning rates for each optimizer
     optimizer_lrs: Sequence[float]
+    # Holds the hidden state of the high and low modules
     carry: Any
 
+    # Track steps
     step: int
+    # Total number of steps to run for
     total_steps: int
 
-
+# Set up the dataloader for training or evaluation
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
+    # Initiate loading of the puzzle dataset
     dataset = PuzzleDataset(PuzzleDatasetConfig(
+        # set seed for reproducibility
         seed=config.seed,
 
+        # dataset path
         dataset_path=config.data_path,
 
+        # multi-gpu optimization to ensure each GPU gets it's own unique subset of data
         rank=rank,
         num_replicas=world_size,
         
         **kwargs
     ), split=split)
+
+    # Wrap in pytorch dataloader
     dataloader = DataLoader(
+        # The puzzle dataset
         dataset,
+        # Set to none because the puzzle dataset already handles batching internally
         batch_size=None,
 
+        # Set 1 CPU process
         num_workers=1,
+        # Each CPU will focus on loading 8 batches ahead of time
         prefetch_factor=8,
 
+        # Optimization to speed up memory transfer from RAM to GPU
         pin_memory=True,
+        # Keep workers alive to prevent overhead of respawning them
         persistent_workers=True
     )
+    # Return both the dataloader and the metadata about the dataset (for tracking vocab size, etc.)
     return dataloader, dataset.metadata
 
-
+# Build the HRM model!
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+    # Create a dictionary for all the model configuration parameters
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
 
+        # For multi-gpu training get the local batch size for each GPU (world size is the total number of GPU workers)
         batch_size=config.global_batch_size // world_size,
 
+        # Pull vocab size, sequence length, and number of puzzle identifiers from the dataset metadata
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        # Encoder only architecture (Bert-like)
         causal=False  # Non-autoregressive
     )
 
-    # Instantiate model with loss head
+
+    # Instantiate model with loss head based on names in the configuration file
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
+    # Create model directly on the GPU
     with torch.device("cuda"):
+        # Instantiate the base model
         model: nn.Module = model_cls(model_cfg)
+        # Wrap the model with the loss head
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        # Enable torch compile to optimize the model further
+        # Disable for debugging and clearer error messages
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore
 
         # Broadcast parameters from rank 0
+        # Copy the same random weights to all GPUs
         if world_size > 1:
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
@@ -135,6 +166,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     # Optimizers and lr
     optimizers = [
+        # Set up the sparse puzzle embedding optimizer to address sparse gradients across the puzzle embeddings
         CastedSparseEmbeddingSignSGD_Distributed(
             model.model.puzzle_emb.buffers(),  # type: ignore
             
@@ -143,6 +175,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
             world_size=world_size
         ),
+        # AdamATan2 optimizer for the rest of the model parameters (variant of the Adam optimizer)
+        # Addresses scale invariance making the model less sensitive to the scale of the weights
+        # and ultimately make the learning rate easier to tune
         AdamATan2(
             model.parameters(),
 
@@ -151,24 +186,28 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             betas=(config.beta1, config.beta2)
         )
     ]
+    # Put optimizer learning rates in a list
     optimizer_lrs = [
         config.puzzle_emb_lr,
         config.lr
     ]
-
+    
+    # Return the model, optimizers, and their learning rates
     return model, optimizers, optimizer_lrs
 
-
+# learning rate schedule with warmup and cosine decay to dynamically adjust the learning rate during training
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
 ):
+    # increase linearlly during warmup towards the base learning rate
     if current_step < num_warmup_steps:
         return base_lr * float(current_step) / float(max(1, num_warmup_steps))
 
+    # Gradually decrease learning rate following a cosine decay schedule
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
-
+# Create the starting train state
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
@@ -176,26 +215,33 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size=world_size)
 
+    # Return the train state dataclass
     return TrainState(
+        # before first step
         step=0,
         total_steps=total_steps,
 
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
+        # Initial carry is None, will be initialized at first forward pass
         carry=None
     )
 
-
+# Save checkpoints
 def save_train_state(config: PretrainConfig, train_state: TrainState):
     # FIXME: Only saved model.
+    # Look for check point path in cfg_pretrain.yaml
     if config.checkpoint_path is None:
         return
 
+    # Check for existence of checkpoint directory, create if it doesn't exist
     os.makedirs(config.checkpoint_path, exist_ok=True)
+
+    # Save model checkpoint
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
-
+# Helper function for learning rate scheduler
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     return cosine_schedule_with_warmup_lr_lambda(
         current_step=train_state.step,

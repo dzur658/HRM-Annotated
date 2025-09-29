@@ -170,6 +170,3 @@ cython_debug/
 
 # UV pyproject.toml
 pyproject.toml
-
-# Ignore yaml config files
-*.yaml

@@ -251,26 +251,30 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio
     )
 
-
+# Train a single batch
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+    # update the step
     train_state.step += 1
+    # Stop if we have reached the max number of training steps
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
-    # To device
+    # Move batch to device
     batch = {k: v.cuda() for k, v in batch.items()}
 
     # Init carry if it is None
+    # Initialize the hidden state of the high and low modules if this is the first batch
     if train_state.carry is None:
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Forward
+    # Forward returns new hidden state for next step, loss, metrics, and discards other returned values
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
+    # Backward
     ((1 / global_batch_size) * loss).backward()
 
-    # Allreduce
+    # Allreduce make sure to sum gradients across GPUs and synchronize them
     if world_size > 1:
         for param in train_state.model.parameters():
             if param.grad is not None:
@@ -279,11 +283,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Apply optimizer
     lr_this_step = None    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+        # Compute and set the learning rate for this step
         lr_this_step = compute_lr(base_lr, config, train_state)
 
+        # Update the optimizers with the new learning rate
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
+        
+        # Step the optimizer and zero the gradients
         optim.step()
         optim.zero_grad()
 
@@ -297,6 +304,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
 
+        # Process and return metrics on the first GPU
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
@@ -310,7 +318,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
 
 def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    # Use inference for evaluation to disable gradient tracking
     with torch.inference_mode():
+        # Set up id, prediction, and metrics containers
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         
         all_preds = {}
@@ -320,37 +330,52 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
         
         carry = None
+
+        # Iterate through all the batches in the test dataset
         for set_name, batch, global_batch_size in eval_loader:
-            # To device
+            # Move batch to device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
+
+                # Solve each puzzle independently, so reset carry for each batch
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
-            # Forward
+            # Forward (ACT solves the puzzle in multiple steps until it reaches a solution)
             while True:
+                # Run a single thinking segment
                 carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
                 
+                # Break if the Q Head returns true signaling to stop
                 if all_finish:
                     break
-
+            
+            # Save any tensors for inspection
             for collection in (batch, preds):
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
                         all_preds.setdefault(k, [])
                         all_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
-                        
+
+            # Free memory            
             del carry, preds, batch, all_finish
 
             # Aggregate
             set_id = set_ids[set_name]
             
+            # Check if first batch to set up metric storage
             if metric_values is None:
+                # dictionary of metric keys
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
+
+                # assemble metric values tensor
                 metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
-                
+
+            # Compress and add metric values
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
+            # Running total of examples processed for each dataset
             metric_global_batch_size[set_id] += global_batch_size
 
+        # Save predictions made during evaluation
         if len(all_preds) and config.checkpoint_path is not None:
             all_preds = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
 
@@ -360,33 +385,42 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         # Logging
         # Reduce to rank 0
         if metric_values is not None:
+            # Get all metrics across GPUs
             if world_size > 1:
                 dist.reduce(metric_values, dst=0)
             
             if rank == 0:
+                # On the main GPU process, process and return metrics
                 reduced_metrics = metric_values.cpu().numpy()
                 reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
                                    for set_id, set_name in enumerate(set_ids)}
                 
                 # Postprocess
                 for set_name, metrics in reduced_metrics.items():
+                    # Get total number of examples processed
                     count = metrics.pop("count")
+                    # Divide each metric by the count to get the average for each metric
                     reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
-
+                
+                # Return all metrics
                 return reduced_metrics
 
-
+# Save configuration and source code for the run
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
         return
 
+    # Check for existence of checkpoint directory, create if it doesn't exist
     os.makedirs(config.checkpoint_path, exist_ok=True)
 
     # Copy code
     code_list = [
+        # Get the architecture and loss source code paths
         get_model_source_path(config.arch.name),
         get_model_source_path(config.arch.loss.name)
     ]
+
+    # Get code files and copy
     for code_file in code_list:
         if code_file is not None:
             code_name = os.path.basename(code_file)
@@ -401,10 +435,13 @@ def save_code_and_config(config: PretrainConfig):
     # Log code
     wandb.run.log_code(config.checkpoint_path)
 
-
+# Load the configuration and sync across all GPUs
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
+    # Initialize list to hold the config object
     objects = [None]
+    # load the configuration on the main GPU
     if rank == 0:
+        # Get the config from the hydra config and parse into the PretrainConfig dataclass
         config = PretrainConfig(**hydra_config)  # type: ignore
 
         # Naming
@@ -414,28 +451,34 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
-
+        
+        # Put the config object in the list to be broadcasted (if multi-GPU environment)
         objects = [config]
 
+    # Broadcast the config object to all GPUs
     if world_size > 1:
         dist.broadcast_object_list(objects, src=0)
 
     return objects[0]  # type: ignore
 
-
+# Orchestrate the training process across multiple GPUs
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
+    # Default to single GPU
     RANK = 0
     WORLD_SIZE = 1
 
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
-        # Initialize distributed, default device and dtype
+        # Initialize communication between GPUs
         dist.init_process_group(backend="nccl")
 
+        # Set the default device and dtype
         RANK = dist.get_rank()
+        # Get the total number of GPU workers
         WORLD_SIZE = dist.get_world_size()
 
+        # Set the GPU device to the local rank
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         
     # Load sync'ed config
@@ -445,44 +488,59 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Dataset
+    # number of epochs to train before each evaluation
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
+    # total number of train/eval cycles
     total_iters = config.epochs // train_epochs_per_iter
 
+    # Ensure eval interval is a divisor of total epochs
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
+    # Create dataloaders for training and evaluation
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
-    # Train state
+    # Initialize the training state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
 
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
+        # progress bar for training
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
+        # Initialize wandb logging
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        # Log model parameters
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        # Save code and config
         save_code_and_config(config)
 
-    # Training Loop
+    # Training Loop for specified number of epochs
     for _iter_id in range(total_iters):
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
+        # Set model to training state
         train_state.model.train()
+        # Iterate through all batches in the current epoch
         for set_name, batch, global_batch_size in train_loader:
+            # Get metrics from training on the batch
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
+                # Use main GPU to log metrics and update progress bar
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
         ############ Evaluation
+        # Set model to evaluation state
         train_state.model.eval()
+        # Evaluate the model on the evaluation dataset for each epoch
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
         if RANK == 0 and metrics is not None:
+            # Use main GPU to log metrics on evaluation
             wandb.log(metrics, step=train_state.step)
             
         ############ Checkpointing
@@ -496,4 +554,5 @@ def launch(hydra_config: DictConfig):
 
 
 if __name__ == "__main__":
+    # Initiate the training process if this script is run directly
     launch()
